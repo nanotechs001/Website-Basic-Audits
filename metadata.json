@@ -1,0 +1,6 @@
+{
+  "name": "AI Website Auditor",
+  "description": "An AI-powered tool to audit website content and identify misplaced or off-topic information.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
