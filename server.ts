@@ -317,6 +317,19 @@ async function startServer() {
               }
               next = next.next();
           }
+
+          // Fallback for nested layouts (heading wrapped in its own container with
+          // no direct content siblings): use the heading's container body text,
+          // excluding heading text, so subsequentText isn't left empty — an empty
+          // value previously tricked the model into assuming a content mismatch.
+          if (!subsequentText.trim()) {
+              const clone = $(el).parent().clone();
+              clone.find("h1, h2, h3, h4, h5, h6").remove();
+              const within = clone.text().replace(/\s+/g, " ").trim();
+              if (within && within.length <= 1200) {
+                  subsequentText = within;
+              }
+          }
           subsequentText = subsequentText.trim().substring(0, 400);
 
           if (text) {
@@ -327,6 +340,9 @@ async function startServer() {
               });
           }
       });
+
+      // Exact count of H1 tags — used to prevent bogus 'multiple_h1' findings.
+      const h1Count = headingsData.filter((h) => h.tag === "H1").length;
 
       // Extract suspected contact/semantic snippets with HTML markup (so the AI can analyze if correct tags like <address> or <dl> are used)
       const semanticSnippets: { html: string; text: string }[] = [];
@@ -571,7 +587,8 @@ Then audit and identify issues following these rigorous rules:
    Review the list of outgoing links extracted. Point out any 'redirect link' issues - links pointing to unexpected, unrelated, or spam/ad/phishing domains.
 
 3. Heading Structure & Hierarchy Check of H1-H6:
-   - There should be ONLY ONE H1 tag on the page. Multiple H1s must be flagged as 'multiple_h1'.
+   - The "Header Tree Sequence" data below lists EVERY heading on the page with its EXACT tag. This page contains EXACTLY ${h1Count} H1 tag(s). Count the entries whose tag is "H1" yourself to confirm.
+   - Only flag 'multiple_h1' if TWO OR MORE entries in the data have tag "H1". If there is exactly one (or zero) H1, you MUST NOT flag 'multiple_h1' under any circumstances. NEVER speculate about hidden, duplicate, or DOM H1 tags that are not present in the provided data — you can only see what is listed.
    - The hierarchy MUST NOT skip levels. For example, skipping from H1 -> H3, H1 -> H4, or H2 -> H4 directly is an issue. Flag these as 'structure_skip'.
    - Each secondary section starts with an H2, then nested levels must follow an H2 (e.g., H3 is under H2, H4 is under H3).
 
@@ -593,7 +610,9 @@ Then audit and identify issues following these rigorous rules:
         d) Proper nouns or brand names that are lowercase (e.g., "patterson family smiles").
 
 5. Title vs Content Matching:
-   - Analyze whether the heading matches its subsequent text content. Flag as 'mismatched_content' ONLY if the actual content block/paragraphs under a heading have absolutely nothing to do with the heading's title (e.g., an 'Our Team' heading followed immediately by content about bitcoin mining). If they are generally aligned or related, do NOT flag it. Let's be highly accurate and avoid false positives.
+   - Each heading entry has a "subsequentText" field containing the content found under it.
+   - CRITICAL: If "subsequentText" is EMPTY, missing, or blank for a heading, you CANNOT assess a mismatch and you MUST NOT flag 'mismatched_content' for it. Absence of content is NEVER evidence of a mismatch. Do NOT flag based on assumption, on the names of neighbouring headings, or on a heading's position in the sequence.
+   - Only flag 'mismatched_content' when "subsequentText" IS present AND its content has absolutely nothing to do with the heading's title (e.g., an 'Our Team' heading followed by content about bitcoin mining). If they are generally aligned or related, do NOT flag it. Be highly accurate and avoid false positives.
 
 6. Semantic HTML Check:
    - Examine the Suspected Address & Business Hours HTML snippets below.
@@ -778,6 +797,23 @@ DO NOT include any prefix text, markdown formatting blocks (like \`\`\`json), ba
         result = JSON.parse(jsonStr);
       }
       result.contentImages = contentImages;
+
+      // Deterministic guards against two systematic model false positives,
+      // independent of which model ran:
+      //  - 'multiple_h1' when the page actually has <= 1 H1 (models hallucinate
+      //    "there might be other H1s in the DOM").
+      //  - 'mismatched_content' for headings where no content was captured
+      //    (models assume a mismatch from absent content).
+      if (Array.isArray(result.headingIssues)) {
+        const headingsWithoutContent = new Set(
+          headingsData.filter((h) => !h.subsequentText || !h.subsequentText.trim()).map((h) => h.text)
+        );
+        result.headingIssues = result.headingIssues.filter((i: any) => {
+          if (i.issueType === "multiple_h1" && h1Count <= 1) return false;
+          if (i.issueType === "mismatched_content" && headingsWithoutContent.has((i.headingText || "").trim())) return false;
+          return true;
+        });
+      }
 
       // Hard-filter findings the user previously confirmed as false positives.
       // This guarantees suppression on re-scans even if the model ignores the
