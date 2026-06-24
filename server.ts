@@ -295,51 +295,46 @@ async function startServer() {
           return true;
       }).slice(0, 50);
 
-      // Extract heading sequence details before stripping the DOM tags
+      // Extract the heading sequence AND the content that follows each heading,
+      // in true document order. We walk the DOM and attribute every text node to
+      // the most recent heading (until the next heading appears), so
+      // "subsequentText" reflects the real section content even in deeply nested
+      // layouts. This is what lets the AI judge heading-vs-content relevance
+      // instead of guessing from an empty field.
       const headingsData: { tag: string; text: string; subsequentText: string }[] = [];
-      $("h1, h2, h3, h4, h5, h6").each((_, el) => {
-          const tag = (el as any).name ? (el as any).name.toUpperCase() : "";
-          const text = $(el).text().replace(/\s+/g, " ").trim();
-          
-          let subsequentText = "";
-          let next = $(el).next();
-          let siblingsParsed = 0;
-          while (next.length && siblingsParsed < 3) {
-              const firstElem = next[0] as any;
-              const tagType = firstElem && firstElem.name ? firstElem.name.toUpperCase() : "";
-              if (["H1", "H2", "H3", "H4", "H5", "H6"].includes(tagType)) {
-                  break;
-              }
-              const nextTxt = next.text().replace(/\s+/g, " ").trim();
-              if (nextTxt) {
-                  subsequentText += " " + nextTxt;
-                  siblingsParsed++;
-              }
-              next = next.next();
-          }
+      const HEADING_TAGS = new Set(["h1", "h2", "h3", "h4", "h5", "h6"]);
+      const SKIP_TAGS = new Set(["script", "style", "noscript", "template", "svg"]);
+      const MAX_SECTION_CHARS = 500;
 
-          // Fallback for nested layouts (heading wrapped in its own container with
-          // no direct content siblings): use the heading's container body text,
-          // excluding heading text, so subsequentText isn't left empty — an empty
-          // value previously tricked the model into assuming a content mismatch.
-          if (!subsequentText.trim()) {
-              const clone = $(el).parent().clone();
-              clone.find("h1, h2, h3, h4, h5, h6").remove();
-              const within = clone.text().replace(/\s+/g, " ").trim();
-              if (within && within.length <= 1200) {
-                  subsequentText = within;
+      let currentHeading: { tag: string; text: string; subsequentText: string } | null = null;
+      const walkForHeadings = (node: any): void => {
+          if (!node) return;
+          if (node.type === "tag") {
+              const name = (node.name || "").toLowerCase();
+              if (SKIP_TAGS.has(name)) return;
+              if (HEADING_TAGS.has(name)) {
+                  const text = $(node).text().replace(/\s+/g, " ").trim();
+                  if (text) {
+                      currentHeading = { tag: name.toUpperCase(), text, subsequentText: "" };
+                      headingsData.push(currentHeading);
+                  }
+                  // Heading text already captured; don't descend into it for content.
+                  return;
               }
+          } else if (node.type === "text") {
+              const t = (node.data || "").replace(/\s+/g, " ").trim();
+              if (t && currentHeading && currentHeading.subsequentText.length < MAX_SECTION_CHARS) {
+                  currentHeading.subsequentText =
+                      (currentHeading.subsequentText ? currentHeading.subsequentText + " " : "") + t;
+              }
+              return;
           }
-          subsequentText = subsequentText.trim().substring(0, 400);
-
-          if (text) {
-              headingsData.push({
-                  tag,
-                  text,
-                  subsequentText
-              });
-          }
-      });
+          const children = node.children || [];
+          for (const child of children) walkForHeadings(child);
+      };
+      const bodyNode = $("body")[0] || ($.root() as any)[0];
+      walkForHeadings(bodyNode);
+      headingsData.forEach((h) => { h.subsequentText = h.subsequentText.trim().substring(0, 400); });
 
       // Exact count of H1 tags — used to prevent bogus 'multiple_h1' findings.
       const h1Count = headingsData.filter((h) => h.tag === "H1").length;

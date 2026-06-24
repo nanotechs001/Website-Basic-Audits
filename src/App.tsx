@@ -174,61 +174,75 @@ export default function App() {
       setShowProgressBanner(true);
       setLoading(false); // Stop block state and run crawling sequentially in background
 
-      // Step 2: Audit each page
-      let queue = [...discoveredPages];
+      // Step 2: Audit each page strictly IN ORDER. Each page is retried in place
+      // until it finishes — we never advance to the next page while the current
+      // one is unfinished, and a transient failure keeps the page in "scanning"
+      // (auto-retry) rather than showing "failed".
       let completedCount = 0;
-      let totalToAudit = discoveredPages.length;
-      
-      // Track attempts per URL to prevent absolute infinite loops on permanently unparsable pages
-      const attemptCounts: Record<string, number> = {};
-      discoveredPages.forEach(u => attemptCounts[u] = 0);
-      const MAX_ATTEMPTS = 10;
+      const totalToAudit = discoveredPages.length;
 
-      while (queue.length > 0) {
+      // Generous safety cap with capped exponential backoff so a permanently
+      // broken page can't hang forever; transient AI 503s resolve well within it.
+      const MAX_ATTEMPTS = 50;
+
+      for (let i = 0; i < discoveredPages.length; i++) {
         if (activeSessionIdRef.current !== sessionId) return;
-
-        const currentUrl = queue.shift()!;
-        attemptCounts[currentUrl]++;
-        
-        // Update state to scanning
-        setReports((prev) =>
-          prev.map((r) =>
-            r.url === currentUrl ? { ...r, status: 'scanning' } : r
-          )
-        );
+        const currentUrl = discoveredPages[i];
 
         let success = false;
         let lastError = '';
-        let auditData = null;
+        let auditData: any = null;
+        let attempt = 0;
 
-        if (attemptCounts[currentUrl] > 1) {
-           setCrawlerStatus(`Retrying page: ${getRelativePath(currentUrl)} (Attempt ${attemptCounts[currentUrl]}/${MAX_ATTEMPTS})...`);
-        } else {
-           setCrawlerStatus(`Analyzing page: ${getRelativePath(currentUrl)}... (Completed ${completedCount}/${totalToAudit})`);
-        }
+        // Mark the current page as scanning (spinner), clearing any prior error.
+        setReports((prev) =>
+          prev.map((r) => (r.url === currentUrl ? { ...r, status: 'scanning', error: null } : r))
+        );
 
-        try {
-          const auditResponse = await fetch('/api/audit', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ url: currentUrl, siteStructure: discoveredPages, provider, localLlmUrl, localLlmModel }),
-          });
+        while (!success && attempt < MAX_ATTEMPTS) {
+          if (activeSessionIdRef.current !== sessionId) return;
+          attempt++;
+
+          if (attempt === 1) {
+            setCrawlerStatus(`Analyzing page ${i + 1}/${totalToAudit}: ${getRelativePath(currentUrl)}...`);
+          } else {
+            // Keep the page in scanning state while auto-retrying — never "failed".
+            setReports((prev) =>
+              prev.map((r) => (r.url === currentUrl ? { ...r, status: 'scanning', error: null } : r))
+            );
+            setCrawlerStatus(`Retrying ${getRelativePath(currentUrl)} (attempt ${attempt}) — staying on this page until it finishes...`);
+          }
+
+          try {
+            const auditResponse = await fetch('/api/audit', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ url: currentUrl, siteStructure: discoveredPages, provider, localLlmUrl, localLlmModel }),
+            });
+
+            if (activeSessionIdRef.current !== sessionId) return;
+
+            const resData = await auditResponse.json();
+            if (auditResponse.ok) {
+              auditData = resData;
+              success = true;
+            } else {
+              lastError = resData.error || 'Failed to complete audit';
+            }
+          } catch (err: any) {
+            lastError = err.message || 'Network request timed out';
+          }
 
           if (activeSessionIdRef.current !== sessionId) return;
 
-          const resData = await auditResponse.json();
-          if (auditResponse.ok) {
-            auditData = resData;
-            success = true;
-          } else {
-            lastError = resData.error || 'Failed to complete audit';
-            // If it's the known "high demand" error, make sure it is clearly flagged
-            if (lastError.includes('capacity') || lastError.includes('limit') || lastError.includes('overload') || lastError.includes('unavailable') || lastError.includes('busy')) {
-              lastError = "The AI model is currently experiencing very high demand or is temporarily unavailable.";
-            }
+          if (!success) {
+            // Back off (capped) and retry the SAME page. Do not advance.
+            const delay = Math.min(15000, 2000 * attempt);
+            setCrawlerStatus(
+              `${getRelativePath(currentUrl)} hasn't finished yet (attempt ${attempt}). Retrying in ${Math.round(delay / 1000)}s — will not move on until it's done...`
+            );
+            await new Promise((resolve) => setTimeout(resolve, delay));
           }
-        } catch (err: any) {
-          lastError = err.message || 'Network request timed out';
         }
 
         if (activeSessionIdRef.current !== sessionId) return;
@@ -243,34 +257,25 @@ export default function App() {
             )
           );
         } else {
-          // Re-queue if under max attempts
-          if (attemptCounts[currentUrl] < MAX_ATTEMPTS) {
-            queue.push(currentUrl);
-            setReports((prev) =>
-              prev.map((r) =>
-                r.url === currentUrl
-                  ? { ...r, status: 'failed', error: `Attempt ${attemptCounts[currentUrl]} failed: ${lastError}. Re-queued...` }
-                  : r
-              )
-            );
-            setCrawlerStatus(`Error on ${getRelativePath(currentUrl)}, re-queueing to the back...`);
-          } else {
-            completedCount++; // Give up and move on
-            setReports((prev) =>
-              prev.map((r) =>
-                r.url === currentUrl
-                  ? { ...r, status: 'failed', error: `Failed after ${MAX_ATTEMPTS} attempts: ${lastError}` }
-                  : r
-              )
-            );
-          }
+          // Safety cap exhausted. Honour "don't proceed until finished": pause the
+          // crawl here (do not skip ahead) and let the user resume via Retry.
+          setReports((prev) =>
+            prev.map((r) =>
+              r.url === currentUrl
+                ? { ...r, status: 'failed', error: `Could not finish after ${MAX_ATTEMPTS} attempts: ${lastError}. Scan paused on this page — click Retry to resume.` }
+                : r
+            )
+          );
+          setCrawlerStatus(`Paused on ${getRelativePath(currentUrl)} after ${MAX_ATTEMPTS} attempts. Retry this page to continue the scan.`);
+          setIsCrawling(false);
+          return; // do NOT proceed to the next page
         }
 
-        // Rest delay between page audits to keep server and connections healthy
-        if (queue.length > 0) {
+        // Brief rest between pages to keep connections healthy.
+        if (i < discoveredPages.length - 1) {
           if (activeSessionIdRef.current !== sessionId) return;
-          setCrawlerStatus(`Allowing connection to rest before next page... (Completed ${completedCount}/${totalToAudit} unique pages)`);
-          await new Promise((resolve) => setTimeout(resolve, 2000));
+          setCrawlerStatus(`Page finished. Resting briefly before next page... (${completedCount}/${totalToAudit})`);
+          await new Promise((resolve) => setTimeout(resolve, 1500));
         }
       }
 
