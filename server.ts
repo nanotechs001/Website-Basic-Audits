@@ -3,6 +3,7 @@ import path from "path";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import * as cheerio from "cheerio";
+import Anthropic from "@anthropic-ai/sdk";
 
 // Initialize Gemini Client
 const ai = new GoogleGenAI({
@@ -13,6 +14,21 @@ const ai = new GoogleGenAI({
     },
   },
 });
+
+// Lazy initialize Anthropic Client to prevent startup crashes when the key is missing
+let anthropicClient: Anthropic | null = null;
+function getAnthropicClient(): Anthropic {
+  if (!anthropicClient) {
+    const key = process.env.ANTHROPIC_API_KEY;
+    if (!key) {
+      throw new Error("ANTHROPIC_API_KEY is not configured in your Secrets/Environment variables. Please configure the ANTHROPIC_API_KEY secret and try again.");
+    }
+    anthropicClient = new Anthropic({
+      apiKey: key,
+    });
+  }
+  return anthropicClient;
+}
 
 async function startServer() {
   const app = express();
@@ -163,7 +179,7 @@ async function startServer() {
   // API constraints
   app.post("/api/audit", async (req, res) => {
     try {
-      const { url } = req.body;
+      const { url, siteStructure, provider } = req.body;
       if (!url) {
         return res.status(400).json({ error: "URL is required" });
       }
@@ -243,6 +259,101 @@ async function startServer() {
           }
       });
 
+      // Extract suspected contact/semantic snippets with HTML markup (so the AI can analyze if correct tags like <address> or <dl> are used)
+      const semanticSnippets: { html: string; text: string }[] = [];
+      $("address, dl, p, div, footer, section").each((_, el) => {
+          const text = $(el).text().replace(/\s+/g, " ").trim();
+          const tag = (el as any).name ? (el as any).name.toLowerCase() : "";
+          
+          const isAddressCandidate = text.match(/\b\d{3,5}\s+[A-Za-z0-9\.\s]{3,30}\s+(street|st|rd|road|dr|drive|ave|avenue|ln|lane|suite|ste|zip|postal|google.com\/maps)\b/i) || tag === "address";
+          const isHoursCandidate = text.match(/\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon-fri|closed|hours)\b/i) || tag === "dl";
+          
+          if (isAddressCandidate || isHoursCandidate) {
+              const outerHtml = $.html(el);
+              if (outerHtml.length < 2000 && outerHtml.length > 20) {
+                  if (!semanticSnippets.some(s => s.text === text)) {
+                      semanticSnippets.push({
+                          html: outerHtml.substring(0, 1500),
+                          text: text.substring(0, 400)
+                      });
+                  }
+              }
+          }
+      });
+
+      // Extract custom inline/content images and filter out structural ones
+      const contentImages: { src: string; alt: string; parentTag: string }[] = [];
+      $("img").each((_, el) => {
+          const $img = $(el);
+          const src = $img.attr("src") || $img.attr("data-src") || "";
+          const alt = ($img.attr("alt") || $img.attr("title") || "").trim();
+          
+          if (!src || src.startsWith("data:image/svg+xml") || src.startsWith("data:image/gif")) {
+              return;
+          }
+
+          // Exclude structural header/footer layout elements to prevent false positives
+          let isStructural = false;
+          let parent = $img.parent();
+          let depth = 0;
+          while (parent.length && depth < 5) {
+              const parentTag = (parent[0] as any).name?.toLowerCase() || "";
+              const parentId = (parent.attr("id") || "").toLowerCase();
+              const parentClass = (parent.attr("class") || "").toLowerCase();
+              
+              if (["header", "footer", "nav", "aside", "menu"].includes(parentTag)) {
+                  isStructural = true;
+                  break;
+              }
+              if (parentTag === "a" && (parentClass.includes("logo") || parentId.includes("logo"))) {
+                  isStructural = true;
+                  break;
+              }
+              if (parentId.includes("header") || parentId.includes("footer") || parentId.includes("nav") || parentId.includes("sidebar") || parentId.includes("menu")) {
+                  isStructural = true;
+                  break;
+              }
+              if (parentClass.includes("header") || parentClass.includes("footer") || parentClass.includes("nav") || parentClass.includes("sidebar") || parentClass.includes("menu")) {
+                  isStructural = true;
+                  break;
+              }
+              parent = parent.parent();
+              depth++;
+          }
+
+          if (isStructural) return;
+
+          // Exclude image keywords representing logos, site icons, or interface decorations
+          const srcLower = src.toLowerCase();
+          const altLower = alt.toLowerCase();
+          const imgIdLower = ($img.attr("id") || "").toLowerCase();
+          const imgClassLower = ($img.attr("class") || "").toLowerCase();
+
+          const ignoredKeywords = ["logo", "icon", "avatar", "social", "badge", "chevron", "arrow", "button", "sprite", "favicon", "widget"];
+          const matchesIgnored = ignoredKeywords.some(keyword => 
+              srcLower.includes(keyword) || 
+              altLower.includes(keyword) || 
+              imgIdLower.includes(keyword) || 
+              imgClassLower.includes(keyword)
+          );
+
+          if (matchesIgnored) return;
+
+          // Resolve relative pathways to fully qualified absolute URL addresses
+          let absoluteSrc = src;
+          try {
+              absoluteSrc = new URL(src, url).href;
+          } catch (_) {
+              absoluteSrc = src;
+          }
+
+          contentImages.push({
+              src: absoluteSrc,
+              alt: alt || "No alt text provided",
+              parentTag: ($img.parent()[0] as any).name?.toLowerCase() || "div"
+          });
+      });
+
       // Remove scripts, styles, and other non-content tags (guaranteeing no graphic or secondary assets are fetched/rendered)
       $("script, style, noscript, nav, footer, iframe, img, svg, picture, source, video, audio, link, canvas, map, object, embed").remove();
 
@@ -293,11 +404,11 @@ async function startServer() {
                       properties: {
                           anchorText: {
                               type: Type.STRING,
-                              description: "The specific anchor link text / word that contains the redirection or topic mismatch."
+                              description: "The specific anchor link text / word that contains the issue, or the name of an unlinked service."
                           },
                           url: {
                               type: Type.STRING,
-                              description: "The fully qualified target URL page is linking to."
+                              description: "The fully qualified target URL, or 'none' if an expected link to a standalone service page is missing."
                           },
                           section: {
                               type: Type.STRING,
@@ -305,12 +416,12 @@ async function startServer() {
                           },
                           reason: {
                               type: Type.STRING,
-                              description: "Why this link appears to be redirecting to a suspicious, unexpected, or unrelated domain."
+                              description: "Why this link is problematic, e.g., points to unrelated domains, or if a listed service is unlinked and missing navigation to its standalone page."
                           }
                       },
                       required: ["anchorText", "url", "section", "reason"]
                   },
-                  description: "A list of identified redirect, shady, or entirely mismatched outgoing link issues found on the page."
+                  description: "A list of identified redirect, shady, or unlinked service pages and broken pathways."
               },
               headingIssues: {
                   type: Type.ARRAY,
@@ -335,18 +446,44 @@ async function startServer() {
                           },
                           reason: {
                               type: Type.STRING,
-                              description: "Detailed description of the issue under specified criteria (skipped heading, capitalization error, or mismatched paragraph content)."
+                              description: "Detailed description of the issue under specified criteria."
                           }
                        },
                        required: ["headingText", "tag", "issueType", "reason"]
                   },
                   description: "A list of structural, capitalization, or content-match issues detected in the page's headings."
+              },
+              semanticIssues: {
+                  type: Type.ARRAY,
+                  items: {
+                      type: Type.OBJECT,
+                      properties: {
+                          elementContent: {
+                              type: Type.STRING,
+                              description: "The core text excerpt of the non-semantic postal address or business hours block."
+                          },
+                          issueType: {
+                              type: Type.STRING,
+                              description: "Either 'address_missing_address_tag' or 'hours_missing_definition_list'."
+                          },
+                          reason: {
+                              type: Type.STRING,
+                              description: "Clear explanation that physical addresses must use the <address> tag, or that business hours should use <dl> definition maps."
+                          },
+                          recommendation: {
+                              type: Type.STRING,
+                              description: "The specific correct HTML block recommended to fix this issue (e.g., wraps contents in <address> or <dl><dt><dd>)."
+                          }
+                      },
+                      required: ["elementContent", "issueType", "reason", "recommendation"]
+                  },
+                  description: "A list of non-semantic HTML layout practices detected for addresses or hours metadata."
               }
           },
-          required: ["mainTopic", "misplacedContent", "linkIssues", "headingIssues"]
+          required: ["mainTopic", "misplacedContent", "linkIssues", "headingIssues", "semanticIssues"]
       };
 
-      const auditPrompt = `Analyze the following webpage content, links, and heading structure to identify inconsistencies, structural/hierarchical problems, capitalization formatting issues, or content mismatches.
+      const auditPrompt = `Analyze the following webpage content, links, headings, semantic HTML fragments, and full site structure to identify inconsistencies, structural/hierarchical problems, capitalization errors, content mismatches, design-structure mistakes, or unlinked service items.
 
 Identify the main topic/purpose of the site.
 
@@ -383,6 +520,17 @@ Then audit and identify issues following these rigorous rules:
 5. Title vs Content Matching:
    - Analyze whether the heading matches its subsequent text content. Flag as 'mismatched_content' ONLY if the actual content block/paragraphs under a heading have absolutely nothing to do with the heading's title (e.g., an 'Our Team' heading followed immediately by content about bitcoin mining). If they are generally aligned or related, do NOT flag it. Let's be highly accurate and avoid false positives.
 
+6. Semantic HTML Check:
+   - Examine the Suspected Address & Business Hours HTML snippets below.
+   - Grounded rule 1 (Address): Evaluate if any valid postal contact address is missing its <address> tag counterpart. If an address is formatted inside raw paragraphs <p> or general divs <div> without an enclosing <address> tag wrapper, flag it with issueType 'address_missing_address_tag'.
+   - Grounded rule 2 (Business Hours): Evaluate if business open hours are written as raw paragraphs or div tags rather than a semantic definition list map structure (e.g. <dl> with <dt> for days and <dd> for hours). If they are written as raw text blocks, flag it with issueType 'hours_missing_definition_list'. Provide clear recommendations showing correct semantic markup.
+
+7. Services Linking Audit:
+   - Identify sections on the audited page named "Services", "Our Services", or other medical/business service sections.
+   - Review the Existing Site Structure list of indexed pages below.
+   - For every service item listed dynamically in that "Services" section, expect it to actively link to its dedicated service-detail page if such a page exists within the overall site structure (e.g. if 'implants' is listed and a page like '/services/implants' exists in the site structure).
+   - If a highlighted service item has NO link (presented as plain static text) or has broken pathways, flag it under 'linkIssues'. Set anchorText to the service name, url to the target standalone path from site structure (or 'none' if unavailable), section to 'Services Section', and explain inside reason that they should link this service module directly to their standalone detail page to improve internal link discovery/juice.
+
 --- Webpage text content ---
 ${textContent.substring(0, 30000)}
 
@@ -391,24 +539,107 @@ ${JSON.stringify(uniqueLinks, null, 2)}
 
 --- Header Tree Sequence & Content Sections ---
 ${JSON.stringify(headingsData, null, 2)}
+
+--- Extracted Suspected Address & Business Hours HTML snippets ---
+${JSON.stringify(semanticSnippets, null, 2)}
+
+--- Existing Site Structure (Indexed Pages) ---
+${JSON.stringify(siteStructure || [], null, 2)}
 `;
 
-      let aiResponse;
-      try {
-        aiResponse = await ai.models.generateContent({
-            model: "gemini-2.5-flash",
-            contents: auditPrompt,
-            config: {
-                responseMimeType: "application/json",
-                responseSchema: responseSchema,
+      let result;
+
+      if (provider === "local") {
+        const { localLlmUrl, localLlmModel } = req.body;
+        if (!localLlmUrl || !localLlmModel) {
+           throw new Error("Local LLM URL and Model are required for local provider.");
+        }
+        
+        const systemPrompt = `You are a strict, professional SEO and SOP Content Auditor. Your sole task is to analyze the requested webpage parts and return a single, valid JSON object matching this schema shape exactly.
+Object schema shape:
+{
+  "mainTopic": "string descriptive overview of topic",
+  "misplacedContent": [
+    {
+      "excerpt": "string quote from page content",
+      "reason": "string detailed explanation why it is misplaced"
+    }
+  ],
+  "linkIssues": [
+    {
+      "anchorText": "string anchor label / service name",
+      "url": "string completely resolved absolute URL or 'none' if service detailing page link is missing/not linked",
+      "section": "string area content location flag",
+      "reason": "string explanation of issue or recommendation"
+    }
+  ],
+  "headingIssues": [
+    {
+      "headingText": "string exact tag text",
+      "tag": "string like H1/H2/H3",
+      "issueType": "string: 'structure_skip', 'multiple_h1', 'capitalization', 'mismatched_content', or 'other'",
+      "context": "string context info",
+      "reason": "string reason details"
+    }
+  ],
+  "semanticIssues": [
+    {
+      "elementContent": "string raw matched value text",
+      "issueType": "string: 'address_missing_address_tag' or 'hours_missing_definition_list'",
+      "reason": "string detail explaining standard HTML tags rules"
+    }
+  ]
+}
+
+Ensure you strictly obey capitalization rule of false positive checks.
+DO NOT include any prefix text, markdown formatting blocks (like \`\`\`json), backticks, or trailing chat. Return only the parsable JSON string.`;
+
+        try {
+          const localResponse = await fetch(localLlmUrl, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              model: localLlmModel,
+              prompt: systemPrompt + "\n\n" + auditPrompt,
+              stream: false,
+              format: "json", // Try to coerce JSON if supported by Ollama/Local API
+              options: {
                 temperature: 0.2
-            }
-        });
-      } catch (err: any) {
-        console.warn("Primary model 'gemini-2.5-flash' failed or overloaded. Retrying with 'gemini-1.5-flash'...", err);
+              }
+            })
+          });
+
+          if (!localResponse.ok) {
+             throw new Error(`Local server responded with ${localResponse.status}`);
+          }
+
+          const localData = await localResponse.json();
+          const textResponse = localData.response || localData.message?.content || localData.text || "{}";
+            
+          let jsonStr = textResponse.trim();
+          if (jsonStr.startsWith("```json")) {
+            jsonStr = jsonStr.substring(7);
+          }
+          if (jsonStr.startsWith("```")) {
+            jsonStr = jsonStr.substring(3);
+          }
+          if (jsonStr.endsWith("```")) {
+            jsonStr = jsonStr.substring(0, jsonStr.length - 3);
+          }
+          jsonStr = jsonStr.trim();
+          
+          result = JSON.parse(jsonStr);
+        } catch (localErr: any) {
+          console.error("Local LLM audit error:", localErr);
+          throw new Error(`Local LLM audit failed: ${localErr.message || localErr}`);
+        }
+      } else {
+        let aiResponse;
         try {
           aiResponse = await ai.models.generateContent({
-              model: "gemini-1.5-flash",
+              model: "gemini-3.5-flash",
               contents: auditPrompt,
               config: {
                   responseMimeType: "application/json",
@@ -416,13 +647,27 @@ ${JSON.stringify(headingsData, null, 2)}
                   temperature: 0.2
               }
           });
-        } catch (fallbackErr: any) {
-          throw new Error(`AI service is temporarily unavailable due to high demand. Please try again. (Details: ${fallbackErr.message || fallbackErr})`);
+        } catch (err: any) {
+          console.warn("Primary model call failed, retrying with gemini-3.5-flash model...", err);
+          try {
+            aiResponse = await ai.models.generateContent({
+                model: "gemini-3.5-flash",
+                contents: auditPrompt,
+                config: {
+                    responseMimeType: "application/json",
+                    responseSchema: responseSchema,
+                    temperature: 0.2
+                }
+            });
+          } catch (fallbackErr: any) {
+            throw new Error(`AI service is temporarily unavailable due to high demand. Please try again. (Details: ${fallbackErr.message || fallbackErr})`);
+          }
         }
-      }
 
-      const jsonStr = aiResponse.text?.trim() || "{}";
-      const result = JSON.parse(jsonStr);
+        const jsonStr = aiResponse.text?.trim() || "{}";
+        result = JSON.parse(jsonStr);
+      }
+      result.contentImages = contentImages;
 
       res.json(result);
     } catch (error: any) {
@@ -432,6 +677,34 @@ ${JSON.stringify(headingsData, null, 2)}
          clientMsg = "The AI model is currently experiencing very high demand or is temporarily unavailable. Please wait a brief moment and click Analyze again.";
       }
       res.status(500).json({ error: clientMsg });
+    }
+  });
+
+  app.post("/api/test-local", async (req, res) => {
+    try {
+      const { url, model } = req.body;
+      if (!url || !model) {
+        return res.status(400).json({ error: "URL and Model are required" });
+      }
+
+      const localResponse = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: model,
+          prompt: "Hello, this is a test. Reply with 'ok'.",
+          stream: false
+        })
+      });
+
+      if (!localResponse.ok) {
+        return res.status(localResponse.status).json({ error: `Server returned status ${localResponse.status}` });
+      }
+
+      const data = await localResponse.json();
+      res.json({ success: true, data });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || "Connection failed" });
     }
   });
 

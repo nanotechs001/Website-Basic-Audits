@@ -1,4 +1,4 @@
-import { useState, FormEvent, useRef } from 'react';
+import { useState, FormEvent, useRef, useMemo } from 'react';
 import { 
   Search, 
   AlertTriangle, 
@@ -17,9 +17,11 @@ import {
   ArrowRight,
   StopCircle,
   HelpCircle,
-  RefreshCw
+  RefreshCw,
+  Braces,
+  Image as ImageIcon
 } from 'lucide-react';
-import { AuditResult, AuditError, PageAuditReport } from './types';
+import { AuditResult, AuditError, PageAuditReport, ImageIssue } from './types';
 
 export default function App() {
   const [url, setUrl] = useState('');
@@ -31,7 +33,11 @@ export default function App() {
   const [crawlerStatus, setCrawlerStatus] = useState<string>('');
   const [showProgressBanner, setShowProgressBanner] = useState(true);
   const [individualRetryLoading, setIndividualRetryLoading] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<'content' | 'headings' | 'links'>('content');
+  const [activeTab, setActiveTab] = useState<'content' | 'headings' | 'links' | 'semantic' | 'images'>('content');
+  const [provider, setProvider] = useState<'gemini' | 'local'>('gemini');
+  const [localLlmUrl, setLocalLlmUrl] = useState('http://127.0.0.1:11434/api/generate');
+  const [localLlmModel, setLocalLlmModel] = useState('llama3');
+  const [testConnectionStatus, setTestConnectionStatus] = useState<{loading: boolean, success: boolean | null, message: string}>({loading: false, success: null, message: ''});
 
   // Prevent background state pollution and allow graceful stop
   const activeSessionIdRef = useRef<number>(0);
@@ -89,85 +95,103 @@ export default function App() {
       setShowProgressBanner(true);
       setLoading(false); // Stop block state and run crawling sequentially in background
 
-      // Step 2: Audit each page 1 by 1
-      for (let i = 0; i < discoveredPages.length; i++) {
+      // Step 2: Audit each page
+      let queue = [...discoveredPages];
+      let completedCount = 0;
+      let totalToAudit = discoveredPages.length;
+      
+      // Track attempts per URL to prevent absolute infinite loops on permanently unparsable pages
+      const attemptCounts: Record<string, number> = {};
+      discoveredPages.forEach(u => attemptCounts[u] = 0);
+      const MAX_ATTEMPTS = 10;
+
+      while (queue.length > 0) {
         if (activeSessionIdRef.current !== sessionId) return;
 
-        const currentUrl = discoveredPages[i];
+        const currentUrl = queue.shift()!;
+        attemptCounts[currentUrl]++;
         
         // Update state to scanning
         setReports((prev) =>
-          prev.map((r, idx) =>
-            idx === i ? { ...r, status: 'scanning' } : r
+          prev.map((r) =>
+            r.url === currentUrl ? { ...r, status: 'scanning' } : r
           )
         );
 
         let success = false;
-        let retryAttempts = 3;
         let lastError = '';
         let auditData = null;
 
-        for (let attempt = 1; attempt <= retryAttempts; attempt++) {
+        if (attemptCounts[currentUrl] > 1) {
+           setCrawlerStatus(`Retrying page: ${getRelativePath(currentUrl)} (Attempt ${attemptCounts[currentUrl]}/${MAX_ATTEMPTS})...`);
+        } else {
+           setCrawlerStatus(`Analyzing page: ${getRelativePath(currentUrl)}... (Completed ${completedCount}/${totalToAudit})`);
+        }
+
+        try {
+          const auditResponse = await fetch('/api/audit', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url: currentUrl, siteStructure: discoveredPages, provider, localLlmUrl, localLlmModel }),
+          });
+
           if (activeSessionIdRef.current !== sessionId) return;
 
-          if (attempt > 1) {
-            setCrawlerStatus(`Retrying page ${i + 1} of ${discoveredPages.length} (Attempt ${attempt}/${retryAttempts}): ${getRelativePath(currentUrl)}...`);
-            await new Promise((resolve) => setTimeout(resolve, 2500));
+          const resData = await auditResponse.json();
+          if (auditResponse.ok) {
+            auditData = resData;
+            success = true;
           } else {
-            setCrawlerStatus(`Analyzing page ${i + 1} of ${discoveredPages.length}: ${getRelativePath(currentUrl)}...`);
-          }
-
-          try {
-            const auditResponse = await fetch('/api/audit', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ url: currentUrl }),
-            });
-
-            if (activeSessionIdRef.current !== sessionId) return;
-
-            const resData = await auditResponse.json();
-            if (auditResponse.ok) {
-              auditData = resData;
-              success = true;
-              break;
-            } else {
-              lastError = resData.error || 'Failed to complete audit';
-              // If it's the known "high demand" error, make sure it is clearly flagged
-              if (lastError.includes('capacity') || lastError.includes('limit') || lastError.includes('overload') || lastError.includes('unavailable') || lastError.includes('busy')) {
-                lastError = "The AI model is currently experiencing very high demand or is temporarily unavailable. Please wait a brief moment and click Retry.";
-              }
+            lastError = resData.error || 'Failed to complete audit';
+            // If it's the known "high demand" error, make sure it is clearly flagged
+            if (lastError.includes('capacity') || lastError.includes('limit') || lastError.includes('overload') || lastError.includes('unavailable') || lastError.includes('busy')) {
+              lastError = "The AI model is currently experiencing very high demand or is temporarily unavailable.";
             }
-          } catch (err: any) {
-            lastError = err.message || 'Network request timed out';
           }
+        } catch (err: any) {
+          lastError = err.message || 'Network request timed out';
         }
 
         if (activeSessionIdRef.current !== sessionId) return;
 
         if (success && auditData) {
+          completedCount++;
           setReports((prev) =>
-            prev.map((r, idx) =>
-              idx === i
+            prev.map((r) =>
+              r.url === currentUrl
                 ? { ...r, status: 'completed', result: auditData as AuditResult, error: null }
                 : r
             )
           );
         } else {
-          setReports((prev) =>
-            prev.map((r, idx) =>
-              idx === i
-                ? { ...r, status: 'failed', error: lastError }
-                : r
-            )
-          );
+          // Re-queue if under max attempts
+          if (attemptCounts[currentUrl] < MAX_ATTEMPTS) {
+            queue.push(currentUrl);
+            setReports((prev) =>
+              prev.map((r) =>
+                r.url === currentUrl
+                  ? { ...r, status: 'failed', error: `Attempt ${attemptCounts[currentUrl]} failed: ${lastError}. Re-queued...` }
+                  : r
+              )
+            );
+            setCrawlerStatus(`Error on ${getRelativePath(currentUrl)}, re-queueing to the back...`);
+          } else {
+            completedCount++; // Give up and move on
+            setReports((prev) =>
+              prev.map((r) =>
+                r.url === currentUrl
+                  ? { ...r, status: 'failed', error: `Failed after ${MAX_ATTEMPTS} attempts: ${lastError}` }
+                  : r
+              )
+            );
+          }
         }
 
         // Rest delay between page audits to keep server and connections healthy
-        if (i < discoveredPages.length - 1) {
+        if (queue.length > 0) {
           if (activeSessionIdRef.current !== sessionId) return;
-          setCrawlerStatus(`Allowing connection to rest before next page... (Scanned ${i + 1}/${discoveredPages.length} pages)`);
-          await new Promise((resolve) => setTimeout(resolve, 1500));
+          setCrawlerStatus(`Allowing connection to rest before next page... (Completed ${completedCount}/${totalToAudit} unique pages)`);
+          await new Promise((resolve) => setTimeout(resolve, 2000));
         }
       }
 
@@ -253,7 +277,7 @@ export default function App() {
         const auditResponse = await fetch('/api/audit', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url: targetUrl }),
+          body: JSON.stringify({ url: targetUrl, siteStructure: reports.map((r) => r.url), provider }),
         });
 
         const resData = await auditResponse.json();
@@ -323,14 +347,86 @@ export default function App() {
     }
   };
 
+  const auditedReports = useMemo<PageAuditReport[]>(() => {
+    return reports.map((report) => {
+      if (report.status !== 'completed' || !report.result) return report;
+      
+      const contentImages = report.result.contentImages || [];
+      const localSrcCounts: { [src: string]: number } = {};
+      
+      contentImages.forEach((img) => {
+        localSrcCounts[img.src] = (localSrcCounts[img.src] || 0) + 1;
+      });
+
+      const otherPagesWithImg: { [src: string]: string[] } = {};
+      reports.forEach((other) => {
+        if (other.url === report.url || other.status !== 'completed' || !other.result) return;
+        const otherImages = other.result.contentImages || [];
+        otherImages.forEach((oImg) => {
+          if (!otherPagesWithImg[oImg.src]) {
+            otherPagesWithImg[oImg.src] = [];
+          }
+          if (!otherPagesWithImg[oImg.src].includes(other.url)) {
+            otherPagesWithImg[oImg.src].push(other.url);
+          }
+        });
+      });
+
+      const imageIssues: ImageIssue[] = [];
+      const uniqueSrcs: string[] = Array.from(new Set(contentImages.map((img) => img.src as string)));
+
+      uniqueSrcs.forEach((src: string) => {
+        const matches = contentImages.filter(img => img.src === src);
+        const firstMatch = matches[0];
+        const count = matches.length;
+        const others = otherPagesWithImg[src] || [];
+
+        // 1. Same-Page Duplication
+        if (count > 1) {
+          imageIssues.push({
+            src,
+            alt: firstMatch?.alt || "No descriptive alt text provided",
+            duplicationType: 'same_page',
+            occurrences: count,
+            reason: `This custom content image is displayed ${count} times on this single page. Redundant visual content blocks detract from modern visual design standards, slow browser layout performance, and offer a poor user experience.`,
+            recommendation: `Consolidate repeating sections, replace extra occurrences with contextual graphics or custom illustration elements, or use CSS sprites/classes if they represent visual icons.`
+          });
+        }
+
+        // 2. Cross-Page Duplication (Global Site Context)
+        if (others.length > 0) {
+          imageIssues.push({
+            src,
+            alt: firstMatch?.alt || "No descriptive alt text provided",
+            duplicationType: 'cross_page',
+            occurrences: count + others.length,
+            otherPages: others,
+            reason: `This content image is reused identically across ${others.length} other page(s) of this website. Excessive duplication of media assets across separate URLs dilutes organic visual SEO and reduces search engine crawl efficiency.`,
+            recommendation: `Introduce distinct bespoke visual figures for each unique page context. Structural corporate branding/logos are safely skipped automatically, but distinct page context image bodies require unique files.`
+          });
+        }
+      });
+
+      return {
+        ...report,
+        result: {
+          ...report.result,
+          imageIssues
+        }
+      };
+    });
+  }, [reports]);
+
   // Derived dashboard statistics
-  const selectedReport = reports.find((r) => r.url === selectedUrl);
+  const selectedReport = auditedReports.find((r) => r.url === selectedUrl);
   const totalHeadingIssues = selectedReport?.result?.headingIssues?.length || 0;
   const totalLinkIssues = selectedReport?.result?.linkIssues?.length || 0;
   const totalContentIssues = selectedReport?.result?.misplacedContent?.length || 0;
+  const totalSemanticIssues = selectedReport?.result?.semanticIssues?.length || 0;
+  const totalImageIssues = selectedReport?.result?.imageIssues?.length || 0;
 
   const healthScore = selectedReport?.result
-    ? Math.max(0, Math.min(100, 100 - (totalHeadingIssues * 6 + totalLinkIssues * 15 + totalContentIssues * 10)))
+    ? Math.max(0, Math.min(100, 100 - (totalHeadingIssues * 6 + totalLinkIssues * 15 + totalContentIssues * 10 + totalSemanticIssues * 10 + totalImageIssues * 12)))
     : 100;
 
   // Queue progression calculations
@@ -397,24 +493,106 @@ export default function App() {
             )}
           </form>
 
-          {/* Quick Info & Preset Examples */}
-          <div className="flex flex-wrap items-center justify-between gap-3 px-1 text-xs">
-            <div className="flex items-center gap-1.5 text-blue-600 bg-blue-50 px-2.5 py-1 rounded-full font-medium border border-blue-100">
-              <span className="relative flex h-1.5 w-1.5 animate-pulse">
-                <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-blue-500"></span>
-              </span>
-              🔒 Auditing is sequential with rests to prevent rate limits & connection timeouts
-            </div>
-            <div className="flex items-center gap-2 text-neutral-500">
-              <span className="hidden sm:inline">Try preset:</span>
+          {/* Provider Selection */}
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-white p-3 rounded-2xl border border-neutral-200 shadow-sm">
+            <span className="text-xs font-bold text-neutral-500 uppercase tracking-wider pl-1.5">
+              AI Auditor Engine:
+            </span>
+            <div className="flex items-center gap-1.5">
               <button
                 type="button"
-                onClick={() => setUrl('https://pattersonfamilysmiles.viziglobal.com')}
+                onClick={() => !loading && !isCrawling && setProvider('gemini')}
                 disabled={loading || isCrawling}
-                className="hover:text-blue-600 underline cursor-pointer font-medium disabled:opacity-50"
+                className={`text-xs font-semibold px-3.5 py-2 rounded-xl border transition-all flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50 ${
+                  provider === 'gemini'
+                    ? 'bg-blue-50 text-blue-700 border-blue-200 shadow-sm font-bold'
+                    : 'bg-neutral-50 text-neutral-600 border-neutral-200 hover:bg-neutral-100'
+                }`}
               >
-                Patterson Family Smiles
+                <span className="h-1.5 w-1.5 rounded-full bg-blue-500 animate-pulse" />
+                <span>Google Gemini 3.5</span>
               </button>
+              <button
+                type="button"
+                onClick={() => !loading && !isCrawling && setProvider('local')}
+                disabled={loading || isCrawling}
+                className={`text-xs font-semibold px-3.5 py-2 rounded-xl border transition-all flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50 ${
+                  provider === 'local'
+                    ? 'bg-purple-50 text-purple-800 border-purple-200 shadow-sm font-bold'
+                    : 'bg-neutral-50 text-neutral-600 border-neutral-200 hover:bg-neutral-100'
+                }`}
+              >
+                <span className="h-1.5 w-1.5 rounded-full bg-purple-500 animate-pulse" />
+                <span>Local LLM</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Quick Info */}
+          <div className="flex flex-col gap-2 pt-1">
+            {provider === 'local' && (
+              <div className="bg-purple-50/50 border border-purple-100 p-3 rounded-2xl animate-in fade-in duration-300 space-y-3">
+                <div className="text-[11px] text-purple-800 leading-relaxed font-medium">
+                  Provide your local LLM inference server endpoint (e.g., Ollama or standard OpenAI-compatible API).
+                </div>
+                <div className="flex flex-col sm:flex-row gap-3">
+                  <input
+                    type="url"
+                    value={localLlmUrl}
+                    onChange={(e) => setLocalLlmUrl(e.target.value)}
+                    disabled={loading || isCrawling}
+                    className="flex-1 px-3 py-1.5 text-xs rounded-lg border border-purple-200 bg-white focus:outline-none focus:ring-2 focus:ring-purple-500/20 disabled:opacity-50"
+                    placeholder="Endpoint URL (e.g., http://127.0.0.1:11434/api/generate)"
+                  />
+                  <input
+                    type="text"
+                    value={localLlmModel}
+                    onChange={(e) => setLocalLlmModel(e.target.value)}
+                    disabled={loading || isCrawling}
+                    className="w-full sm:w-32 px-3 py-1.5 text-xs rounded-lg border border-purple-200 bg-white focus:outline-none focus:ring-2 focus:ring-purple-500/20 disabled:opacity-50"
+                    placeholder="Model (e.g. llama3)"
+                  />
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      setTestConnectionStatus({ loading: true, success: null, message: '' });
+                      try {
+                        const res = await fetch('/api/test-local', {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ url: localLlmUrl, model: localLlmModel })
+                        });
+                        const data = await res.json();
+                        if (res.ok && data.success) {
+                          setTestConnectionStatus({ loading: false, success: true, message: 'Connection successful!' });
+                        } else {
+                          setTestConnectionStatus({ loading: false, success: false, message: data.error || 'Connection failed' });
+                        }
+                      } catch (e: any) {
+                        setTestConnectionStatus({ loading: false, success: false, message: e.message || 'Network error' });
+                      }
+                    }}
+                    disabled={testConnectionStatus.loading || loading || isCrawling}
+                    className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-purple-600 hover:bg-purple-700 text-white transition-colors disabled:opacity-50 whitespace-nowrap"
+                  >
+                    {testConnectionStatus.loading ? 'Testing...' : 'Test Connection'}
+                  </button>
+                </div>
+                {testConnectionStatus.success !== null && (
+                  <div className={`text-[10px] font-bold ${testConnectionStatus.success ? 'text-emerald-600' : 'text-red-600'}`}>
+                    {testConnectionStatus.success ? '✅ ' : '❌ '} {testConnectionStatus.message}
+                  </div>
+                )}
+              </div>
+            )}
+            
+            <div className="flex flex-wrap items-center justify-between gap-3 px-1 text-xs">
+              <div className="flex items-center gap-1.5 text-blue-600 bg-blue-50 px-2.5 py-1 rounded-full font-medium border border-blue-100">
+                <span className="relative flex h-1.5 w-1.5 animate-pulse">
+                  <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-blue-500"></span>
+                </span>
+                <span>🔒 Auditing is sequential with rests to prevent rate limits & connection timeouts</span>
+              </div>
             </div>
           </div>
         </div>
@@ -470,7 +648,7 @@ export default function App() {
               </div>
 
               <div className="space-y-1.5 max-h-[460px] overflow-y-auto pr-1">
-                {reports.map((report) => {
+                {auditedReports.map((report) => {
                   const isActive = report.url === selectedUrl;
                   return (
                     <button
@@ -521,6 +699,26 @@ export default function App() {
                               title="Link Issues count"
                             >
                               L: {report.result.linkIssues?.length || 0}
+                            </span>
+                            <span 
+                              className={`px-1 py-0.5 rounded text-[10px] font-medium border flex items-center gap-0.5 ${
+                                (report.result.semanticIssues?.length || 0) > 0 
+                                  ? 'bg-purple-50 text-purple-700 border-purple-100' 
+                                  : 'bg-neutral-50 text-neutral-400 border-neutral-100'
+                              }`}
+                              title="Semantic HTML Issues count"
+                            >
+                              S: {report.result.semanticIssues?.length || 0}
+                            </span>
+                            <span 
+                              className={`px-1 py-0.5 rounded text-[10px] font-medium border flex items-center gap-0.5 ${
+                                (report.result.imageIssues?.length || 0) > 0 
+                                  ? 'bg-violet-100 text-violet-800 border-violet-200' 
+                                  : 'bg-neutral-50 text-neutral-400 border-neutral-100'
+                              }`}
+                              title="Image Duplicate Issues count"
+                            >
+                              I: {report.result.imageIssues?.length || 0}
                             </span>
                           </div>
                         )}
@@ -753,6 +951,30 @@ export default function App() {
                           <ExternalLink size={16} />
                           <span>Links ({totalLinkIssues})</span>
                         </button>
+
+                        <button
+                          onClick={() => setActiveTab('semantic')}
+                          className={`pb-3 px-4 font-semibold text-xs sm:text-sm transition-all focus:outline-none flex items-center gap-2 border-b-2 -mb-[2px] ${
+                            activeTab === 'semantic'
+                              ? 'border-blue-600 text-blue-600'
+                              : 'border-transparent text-neutral-500 hover:text-neutral-800'
+                          }`}
+                        >
+                          <Braces size={16} />
+                          <span>Semantic HTML ({totalSemanticIssues})</span>
+                        </button>
+
+                        <button
+                          onClick={() => setActiveTab('images')}
+                          className={`pb-3 px-4 font-semibold text-xs sm:text-sm transition-all focus:outline-none flex items-center gap-2 border-b-2 -mb-[2px] ${
+                            activeTab === 'images'
+                              ? 'border-blue-600 text-blue-600'
+                              : 'border-transparent text-neutral-500 hover:text-neutral-800'
+                          }`}
+                        >
+                          <ImageIcon size={16} />
+                          <span>Image Duplicates ({totalImageIssues})</span>
+                        </button>
                       </div>
 
                       {/* TAB CONTENTS RENDERER */}
@@ -905,6 +1127,175 @@ export default function App() {
                                       </div>
                                   </div>
                               ))}
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      {/* Tab 4: Semantic HTML Issue reports */}
+                      {activeTab === 'semantic' && (
+                        <div className="space-y-4 animate-in fade-in duration-300">
+                          {totalSemanticIssues === 0 ? (
+                            <div className="bg-emerald-50/50 border border-emerald-100 rounded-2xl p-8 text-center text-emerald-800 space-y-2">
+                                <CheckCircle className="mx-auto text-emerald-500 animate-bounce" size={28} />
+                                <p className="font-semibold text-sm">Semantic Structure is Perfect!</p>
+                                <p className="text-xs text-emerald-600/90">AI detected no missing address elements or un-mapped business hour details on this page.</p>
+                            </div>
+                          ) : (
+                            <div className="grid gap-4">
+                                {selectedReport.result?.semanticIssues?.map((item, index) => {
+                                   let badgeColor = "bg-purple-50 text-purple-700 border-purple-100";
+                                   let label = "Semantic HTML Warning";
+                                   if (item.issueType === "address_missing_address_tag") {
+                                      badgeColor = "bg-rose-50 text-rose-700 border-rose-100";
+                                      label = "Missing <address> Tag";
+                                   } else if (item.issueType === "hours_missing_definition_list") {
+                                      badgeColor = "bg-amber-50 text-amber-700 border-amber-100";
+                                      label = "Missing Definition List <dl>";
+                                   }
+
+                                   return (
+                                       <div key={index} className="bg-white rounded-xl p-4 sm:p-5 border border-neutral-200 shadow-sm flex flex-col items-stretch gap-4 hover:border-neutral-300 transition-colors animate-in fade-in duration-200">
+                                           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-neutral-100 pb-3">
+                                               <span className={`text-[10px] font-extrabold px-2 py-0.5 rounded border shrink-0 uppercase tracking-widest ${badgeColor} w-fit`}>
+                                                   {label}
+                                               </span>
+                                               <span className="text-[10px] text-neutral-400 font-mono">
+                                                   Issue #{index + 1}
+                                               </span>
+                                           </div>
+
+                                           <div className="space-y-3">
+                                               <div className="text-xs space-y-1">
+                                                   <span className="font-bold text-neutral-500 uppercase tracking-wider text-[9px] block">Non-semantic Markup snippet matched:</span>
+                                                   <div className="bg-neutral-50 border border-neutral-200 rounded p-3 font-mono text-[11px] text-neutral-700 whitespace-pre-wrap overflow-x-auto">
+                                                       {item.elementContent}
+                                                   </div>
+                                               </div>
+
+                                               <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs pt-1">
+                                                   <div className="bg-red-50/50 p-3 rounded-lg border border-red-100/50 space-y-1">
+                                                       <span className="font-extrabold text-red-800">Violation Reason</span>
+                                                       <p className="text-neutral-700 leading-relaxed text-[11px]">
+                                                           {item.reason}
+                                                       </p>
+                                                   </div>
+                                                   <div className="bg-emerald-50/50 p-3 rounded-lg border border-emerald-100/50 space-y-1">
+                                                       <span className="font-extrabold text-emerald-800">HTML Standard Remediation</span>
+                                                       <p className="text-neutral-700 leading-relaxed text-[11px] font-mono whitespace-pre-wrap">
+                                                           {item.recommendation}
+                                                       </p>
+                                                   </div>
+                                               </div>
+                                           </div>
+                                       </div>
+                                   );
+                                })}
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      {/* Tab 5: Image Duplicate Audit reports */}
+                      {activeTab === 'images' && (
+                        <div className="space-y-4 animate-in fade-in duration-300">
+                          {totalImageIssues === 0 ? (
+                            <div className="bg-emerald-50/50 border border-emerald-100 rounded-2xl p-8 text-center text-emerald-800 space-y-2">
+                                <CheckCircle className="mx-auto text-emerald-500 animate-bounce" size={28} />
+                                <p className="font-semibold text-sm">Perfect Visual Quality Control!</p>
+                                <p className="text-xs text-emerald-600/90">No repetitive layout or content images were detected inside this page's custom blocks.</p>
+                            </div>
+                          ) : (
+                            <div className="grid gap-4">
+                                {selectedReport.result?.imageIssues?.map((item, index) => {
+                                   let badgeColor = "bg-violet-50 text-violet-700 border-violet-100";
+                                   let label = "Visual Duplication Warning";
+                                   if (item.duplicationType === "same_page") {
+                                      badgeColor = "bg-amber-50 text-amber-700 border-amber-100";
+                                      label = "Same-Page Duplication";
+                                   } else if (item.duplicationType === "cross_page") {
+                                      badgeColor = "bg-purple-50 text-purple-700 border-purple-100";
+                                      label = "Cross-Page Duplication";
+                                   }
+
+                                   return (
+                                       <div key={index} className="bg-white rounded-xl p-4 sm:p-5 border border-neutral-200 shadow-sm flex flex-col items-stretch gap-4 hover:border-neutral-300 transition-colors animate-in fade-in duration-200">
+                                           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-neutral-100 pb-3">
+                                               <span className={`text-[10px] font-extrabold px-2 py-0.5 rounded border shrink-0 uppercase tracking-widest ${badgeColor} w-fit`}>
+                                                   {label}
+                                               </span>
+                                               <span className="text-[10px] text-neutral-400 font-mono">
+                                                   Occurrences: {item.occurrences}
+                                               </span>
+                                           </div>
+
+                                           <div className="grid grid-cols-1 md:grid-cols-4 gap-4 items-start">
+                                               {/* Small thumbnail preview */}
+                                               <div className="relative border border-neutral-200 rounded-lg overflow-hidden bg-neutral-50 h-24 flex items-center justify-center p-1 group col-span-1">
+                                                   <img 
+                                                       src={item.src} 
+                                                       alt={item.alt}
+                                                       referrerPolicy="no-referrer"
+                                                       className="max-h-full max-w-full object-contain filter drop-shadow group-hover:scale-105 transition-transform"
+                                                       onError={(e) => {
+                                                           (e.target as HTMLElement).style.display = 'none';
+                                                       }}
+                                                   />
+                                                   <div className="absolute inset-0 flex items-center justify-center bg-neutral-150/10 text-[9px] text-neutral-400 pointer-events-none text-center px-1 font-sans">
+                                                       Preview
+                                                   </div>
+                                               </div>
+
+                                               <div className="md:col-span-3 text-xs space-y-2">
+                                                   <div className="space-y-0.5">
+                                                       <span className="font-bold text-neutral-500 uppercase tracking-wider text-[9px] block">Image URL Source:</span>
+                                                       <a 
+                                                           href={item.src} 
+                                                           target="_blank" 
+                                                           rel="noreferrer" 
+                                                           className="text-blue-600 hover:underline font-mono text-[11px] block break-all"
+                                                       >
+                                                           {item.src}
+                                                       </a>
+                                                   </div>
+                                                   <div className="space-y-0.5">
+                                                       <span className="font-bold text-neutral-500 uppercase tracking-wider text-[9px] block">Alt Text:</span>
+                                                       <p className="text-neutral-700 italic text-[11px]">
+                                                           "{item.alt}"
+                                                       </p>
+                                                   </div>
+                                                   {item.otherPages && item.otherPages.length > 0 && (
+                                                       <div className="space-y-1 pt-1.5 border-t border-neutral-100">
+                                                           <span className="font-bold text-neutral-500 uppercase tracking-wider text-[9px] block">Shared with companion page(s):</span>
+                                                           <ul className="list-disc pl-4 space-y-0.5 font-mono">
+                                                               {item.otherPages.map((pageUrl) => (
+                                                                   <li key={pageUrl} className="text-neutral-600 text-[10px] break-all list-item">
+                                                                       {getRelativePath(pageUrl)} <span className="text-neutral-400 font-sans truncate inline-block max-w-[200px] align-bottom">({pageUrl})</span>
+                                                                   </li>
+                                                               ))}
+                                                           </ul>
+                                                       </div>
+                                                   )}
+                                               </div>
+                                           </div>
+
+                                           <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs pt-1 border-t border-neutral-100">
+                                               <div className="bg-red-50/50 p-3 rounded-lg border border-red-100/50 space-y-1">
+                                                   <span className="font-extrabold text-red-800">SEO / SOP Impact</span>
+                                                   <p className="text-neutral-700 leading-relaxed text-[11px]">
+                                                       {item.reason}
+                                                   </p>
+                                               </div>
+                                               <div className="bg-emerald-50/50 p-3 rounded-lg border border-emerald-100/50 space-y-1">
+                                                   <span className="font-extrabold text-emerald-800">Correction Standard</span>
+                                                   <p className="text-neutral-700 leading-relaxed text-[11px]">
+                                                       {item.recommendation}
+                                                   </p>
+                                               </div>
+                                           </div>
+                                       </div>
+                                   );
+                                })}
                             </div>
                           )}
                         </div>
