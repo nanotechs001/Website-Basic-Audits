@@ -6,3 +6,6 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Per-site audit learnings (false-positive feedback)
+learnings/

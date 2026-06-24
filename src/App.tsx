@@ -19,9 +19,52 @@ import {
   HelpCircle,
   RefreshCw,
   Braces,
-  Image as ImageIcon
+  Image as ImageIcon,
+  Ban,
+  Cloud,
+  Cpu
 } from 'lucide-react';
 import { AuditResult, AuditError, PageAuditReport, ImageIssue } from './types';
+
+// Preset Ollama models so users pick instead of typing. Cloud models require an
+// Ollama paid subscription (ollama.com/upgrade); local models run on this machine.
+const OLLAMA_MODELS: { group: string; options: { value: string; label: string }[] }[] = [
+  {
+    group: 'Local (runs on your machine)',
+    options: [
+      { value: 'llama3.2', label: 'llama3.2 (3B, recommended)' },
+      { value: 'llava', label: 'llava (vision, lightweight)' },
+    ],
+  },
+  {
+    group: 'Cloud (requires Ollama subscription)',
+    options: [
+      { value: 'glm-5.2:cloud', label: 'glm-5.2:cloud' },
+      { value: 'kimi-k2.7-code:cloud', label: 'kimi-k2.7-code:cloud' },
+      { value: 'nemotron-3-super:cloud', label: 'nemotron-3-super:cloud' },
+    ],
+  },
+];
+
+// Stable key for a single issue, used to track which findings the user has
+// dismissed as false positives.
+const issueKey = (url: string, category: string, identifier: string) =>
+  `${url}::${category}::${identifier}`;
+
+// "Mark as false positive" control shown on every AI-detected finding.
+function FalsePositiveButton({ onClick }: { onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title="Mark as false positive — hides it here and teaches future scans to skip it"
+      className="shrink-0 self-start flex items-center gap-1 px-2 py-1 rounded-lg border border-neutral-200 bg-neutral-50 text-neutral-500 hover:bg-rose-50 hover:text-rose-600 hover:border-rose-200 transition-colors text-[10px] font-semibold cursor-pointer"
+    >
+      <Ban size={12} />
+      <span className="hidden sm:inline">False positive</span>
+    </button>
+  );
+}
 
 export default function App() {
   const [url, setUrl] = useState('');
@@ -36,8 +79,44 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<'content' | 'headings' | 'links' | 'semantic' | 'images'>('content');
   const [provider, setProvider] = useState<'gemini' | 'local'>('gemini');
   const [localLlmUrl, setLocalLlmUrl] = useState('http://127.0.0.1:11434/api/generate');
-  const [localLlmModel, setLocalLlmModel] = useState('llama3');
+  const [localLlmModel, setLocalLlmModel] = useState('llama3.2');
   const [testConnectionStatus, setTestConnectionStatus] = useState<{loading: boolean, success: boolean | null, message: string}>({loading: false, success: null, message: ''});
+
+  // Findings the user dismissed as false positives (also persisted server-side
+  // as per-site learnings that feed the next scan).
+  const [ignoredKeys, setIgnoredKeys] = useState<Set<string>>(new Set());
+  const [feedbackToast, setFeedbackToast] = useState<string | null>(null);
+
+  const submitFeedback = async (
+    pageUrl: string,
+    category: string,
+    identifier: string,
+    aiReason: string
+  ) => {
+    const key = issueKey(pageUrl, category, identifier);
+    // Optimistically hide the finding immediately.
+    setIgnoredKeys((prev) => {
+      const next = new Set(prev);
+      next.add(key);
+      return next;
+    });
+    try {
+      const res = await fetch('/api/feedback', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: pageUrl, category, identifier, aiReason }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setFeedbackToast(`Marked as false positive. Saved to learnings (${data.file}); future scans will skip it.`);
+      } else {
+        setFeedbackToast(`Hidden here, but saving to learnings failed: ${data.error || 'unknown error'}`);
+      }
+    } catch (e: any) {
+      setFeedbackToast(`Hidden here, but saving to learnings failed: ${e.message || 'network error'}`);
+    }
+    setTimeout(() => setFeedbackToast(null), 5000);
+  };
 
   // Prevent background state pollution and allow graceful stop
   const activeSessionIdRef = useRef<number>(0);
@@ -277,7 +356,7 @@ export default function App() {
         const auditResponse = await fetch('/api/audit', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url: targetUrl, siteStructure: reports.map((r) => r.url), provider }),
+          body: JSON.stringify({ url: targetUrl, siteStructure: reports.map((r) => r.url), provider, localLlmUrl, localLlmModel }),
         });
 
         const resData = await auditResponse.json();
@@ -419,10 +498,31 @@ export default function App() {
 
   // Derived dashboard statistics
   const selectedReport = auditedReports.find((r) => r.url === selectedUrl);
-  const totalHeadingIssues = selectedReport?.result?.headingIssues?.length || 0;
-  const totalLinkIssues = selectedReport?.result?.linkIssues?.length || 0;
-  const totalContentIssues = selectedReport?.result?.misplacedContent?.length || 0;
-  const totalSemanticIssues = selectedReport?.result?.semanticIssues?.length || 0;
+
+  // Identifier builders — must match the values passed to submitFeedback so the
+  // dismissed-finding filter and the Ignore buttons agree.
+  const contentId = (i: { excerpt: string }) => i.excerpt;
+  const headingId = (i: { headingText: string; tag: string }) => `${i.tag}: ${i.headingText}`;
+  const linkId = (i: { anchorText: string; url: string }) => `${i.anchorText} -> ${i.url}`;
+  const semanticId = (i: { elementContent: string }) => i.elementContent;
+
+  const notIgnored = (category: string, id: string) =>
+    !selectedReport || !ignoredKeys.has(issueKey(selectedReport.url, category, id));
+
+  // Count findings still visible (not dismissed) for any page — used by the sidebar badges.
+  const liveCount = (pageUrl: string, category: string, items: any[] | undefined, idFn: (i: any) => string) =>
+    (items || []).filter((i) => !ignoredKeys.has(issueKey(pageUrl, category, idFn(i)))).length;
+
+  // Visible findings = AI results minus anything the user dismissed this session.
+  const visibleContent = (selectedReport?.result?.misplacedContent || []).filter((i) => notIgnored('content', contentId(i)));
+  const visibleHeadings = (selectedReport?.result?.headingIssues || []).filter((i) => notIgnored('heading', headingId(i)));
+  const visibleLinks = (selectedReport?.result?.linkIssues || []).filter((i) => notIgnored('link', linkId(i)));
+  const visibleSemantic = (selectedReport?.result?.semanticIssues || []).filter((i) => notIgnored('semantic', semanticId(i)));
+
+  const totalHeadingIssues = visibleHeadings.length;
+  const totalLinkIssues = visibleLinks.length;
+  const totalContentIssues = visibleContent.length;
+  const totalSemanticIssues = visibleSemantic.length;
   const totalImageIssues = selectedReport?.result?.imageIssues?.length || 0;
 
   const healthScore = selectedReport?.result
@@ -510,7 +610,7 @@ export default function App() {
                 }`}
               >
                 <span className="h-1.5 w-1.5 rounded-full bg-blue-500 animate-pulse" />
-                <span>Google Gemini 3.5</span>
+                <span>Google Gemini</span>
               </button>
               <button
                 type="button"
@@ -544,14 +644,20 @@ export default function App() {
                     className="flex-1 px-3 py-1.5 text-xs rounded-lg border border-purple-200 bg-white focus:outline-none focus:ring-2 focus:ring-purple-500/20 disabled:opacity-50"
                     placeholder="Endpoint URL (e.g., http://127.0.0.1:11434/api/generate)"
                   />
-                  <input
-                    type="text"
+                  <select
                     value={localLlmModel}
                     onChange={(e) => setLocalLlmModel(e.target.value)}
                     disabled={loading || isCrawling}
-                    className="w-full sm:w-32 px-3 py-1.5 text-xs rounded-lg border border-purple-200 bg-white focus:outline-none focus:ring-2 focus:ring-purple-500/20 disabled:opacity-50"
-                    placeholder="Model (e.g. llama3)"
-                  />
+                    className="w-full sm:w-56 px-3 py-1.5 text-xs rounded-lg border border-purple-200 bg-white focus:outline-none focus:ring-2 focus:ring-purple-500/20 disabled:opacity-50 cursor-pointer"
+                  >
+                    {OLLAMA_MODELS.map((grp) => (
+                      <optgroup key={grp.group} label={grp.group}>
+                        {grp.options.map((opt) => (
+                          <option key={opt.value} value={opt.value}>{opt.label}</option>
+                        ))}
+                      </optgroup>
+                    ))}
+                  </select>
                   <button
                     type="button"
                     onClick={async () => {
@@ -583,6 +689,10 @@ export default function App() {
                     {testConnectionStatus.success ? '✅ ' : '❌ '} {testConnectionStatus.message}
                   </div>
                 )}
+                <div className="flex flex-col sm:flex-row gap-2 text-[10px] text-purple-700/80">
+                  <span className="flex items-center gap-1"><Cpu size={11} /> Local models run on this machine (no key, no cost).</span>
+                  <span className="flex items-center gap-1"><Cloud size={11} /> Cloud models require an Ollama subscription.</span>
+                </div>
               </div>
             )}
             
@@ -650,6 +760,11 @@ export default function App() {
               <div className="space-y-1.5 max-h-[460px] overflow-y-auto pr-1">
                 {auditedReports.map((report) => {
                   const isActive = report.url === selectedUrl;
+                  const mCount = liveCount(report.url, 'content', report.result?.misplacedContent, contentId);
+                  const hCount = liveCount(report.url, 'heading', report.result?.headingIssues, headingId);
+                  const lCount = liveCount(report.url, 'link', report.result?.linkIssues, linkId);
+                  const sCount = liveCount(report.url, 'semantic', report.result?.semanticIssues, semanticId);
+                  const iCount = report.result?.imageIssues?.length || 0;
                   return (
                     <button
                       key={report.url}
@@ -670,55 +785,55 @@ export default function App() {
 
                         {report.status === 'completed' && report.result && (
                           <div className="flex flex-wrap gap-1 pt-1.5" onClick={(e) => e.stopPropagation()}>
-                            <span 
+                            <span
                               className={`px-1 py-0.5 rounded text-[10px] font-medium border flex items-center gap-0.5 ${
-                                (report.result.misplacedContent?.length || 0) > 0 
-                                  ? 'bg-amber-50 text-amber-700 border-amber-100' 
+                                mCount > 0
+                                  ? 'bg-amber-50 text-amber-700 border-amber-100'
                                   : 'bg-neutral-50 text-neutral-400 border-neutral-100'
                               }`}
                               title="Misplaced Content count"
                             >
-                              M: {report.result.misplacedContent?.length || 0}
+                              M: {mCount}
                             </span>
-                            <span 
+                            <span
                               className={`px-1 py-0.5 rounded text-[10px] font-medium border flex items-center gap-0.5 ${
-                                (report.result.headingIssues?.length || 0) > 0 
-                                  ? 'bg-blue-50 text-blue-700 border-blue-100' 
+                                hCount > 0
+                                  ? 'bg-blue-50 text-blue-700 border-blue-100'
                                   : 'bg-neutral-50 text-neutral-400 border-neutral-100'
                               }`}
                               title="Heading Issues count"
                             >
-                              H: {report.result.headingIssues?.length || 0}
+                              H: {hCount}
                             </span>
-                            <span 
+                            <span
                               className={`px-1 py-0.5 rounded text-[10px] font-medium border flex items-center gap-0.5 ${
-                                (report.result.linkIssues?.length || 0) > 0 
-                                  ? 'bg-rose-50 text-rose-700 border-rose-100' 
+                                lCount > 0
+                                  ? 'bg-rose-50 text-rose-700 border-rose-100'
                                   : 'bg-neutral-50 text-neutral-400 border-neutral-100'
                               }`}
                               title="Link Issues count"
                             >
-                              L: {report.result.linkIssues?.length || 0}
+                              L: {lCount}
                             </span>
-                            <span 
+                            <span
                               className={`px-1 py-0.5 rounded text-[10px] font-medium border flex items-center gap-0.5 ${
-                                (report.result.semanticIssues?.length || 0) > 0 
-                                  ? 'bg-purple-50 text-purple-700 border-purple-100' 
+                                sCount > 0
+                                  ? 'bg-purple-50 text-purple-700 border-purple-100'
                                   : 'bg-neutral-50 text-neutral-400 border-neutral-100'
                               }`}
                               title="Semantic HTML Issues count"
                             >
-                              S: {report.result.semanticIssues?.length || 0}
+                              S: {sCount}
                             </span>
-                            <span 
+                            <span
                               className={`px-1 py-0.5 rounded text-[10px] font-medium border flex items-center gap-0.5 ${
-                                (report.result.imageIssues?.length || 0) > 0 
-                                  ? 'bg-violet-100 text-violet-800 border-violet-200' 
+                                iCount > 0
+                                  ? 'bg-violet-100 text-violet-800 border-violet-200'
                                   : 'bg-neutral-50 text-neutral-400 border-neutral-100'
                               }`}
                               title="Image Duplicate Issues count"
                             >
-                              I: {report.result.imageIssues?.length || 0}
+                              I: {iCount}
                             </span>
                           </div>
                         )}
@@ -990,7 +1105,7 @@ export default function App() {
                             </div>
                           ) : (
                             <div className="grid gap-3">
-                               {selectedReport.result.misplacedContent.map((item, index) => (
+                               {visibleContent.map((item, index) => (
                                    <div key={index} className="bg-white rounded-xl p-4 sm:p-5 border border-neutral-200 shadow-sm flex items-start gap-4">
                                        <div className="mt-0.5 bg-amber-50 text-amber-600 p-1.5 rounded-lg shrink-0 border border-amber-100">
                                            <AlertTriangle size={16} />
@@ -1000,9 +1115,10 @@ export default function App() {
                                                "{item.excerpt}"
                                            </blockquote>
                                            <p className="text-xs text-neutral-700 font-medium bg-neutral-50/80 py-1.5 px-3 rounded-lg leading-relaxed">
-                                               <span className="text-amber-700 font-bold">Analysis Feedback:</span> {item.reason}
+                                               <span className="text-amber-700 font-bold">Analysis Feedback:</span> {item.reason || <span className="text-neutral-400 italic">No explanation was provided by the model — consider a stronger model (Gemini, or a larger Ollama model).</span>}
                                            </p>
                                        </div>
+                                       <FalsePositiveButton onClick={() => submitFeedback(selectedReport.url, 'content', contentId(item), item.reason)} />
                                    </div>
                                ))}
                             </div>
@@ -1036,7 +1152,7 @@ export default function App() {
                             </div>
                           ) : (
                             <div className="grid gap-3">
-                               {selectedReport.result.headingIssues.map((item, index) => {
+                               {visibleHeadings.map((item, index) => {
                                    let badgeColor = "bg-neutral-100 text-neutral-700 border-neutral-200";
                                    let label = "Issue";
                                    if (item.issueType === "structure_skip") {
@@ -1076,9 +1192,10 @@ export default function App() {
                                               )}
 
                                               <p className="text-xs font-medium text-neutral-700 bg-neutral-50/80 py-1.5 px-3 rounded-md">
-                                                  <span className="text-neutral-900 font-bold">AI Violation Report:</span> {item.reason}
+                                                  <span className="text-neutral-900 font-bold">AI Violation Report:</span> {item.reason || <span className="text-neutral-400 italic">No explanation was provided by the model — consider a stronger model (Gemini, or a larger Ollama model).</span>}
                                               </p>
                                           </div>
+                                          <FalsePositiveButton onClick={() => submitFeedback(selectedReport.url, 'heading', headingId(item), item.reason)} />
                                       </div>
                                    );
                                })}
@@ -1098,7 +1215,7 @@ export default function App() {
                             </div>
                           ) : (
                             <div className="grid gap-3">
-                               {selectedReport.result.linkIssues.map((item, index) => (
+                               {visibleLinks.map((item, index) => (
                                   <div key={index} className="bg-white rounded-xl p-4 sm:p-5 border border-red-100 shadow-sm flex items-start gap-4">
                                       <div className="mt-0.5 bg-red-100 text-red-600 p-1.5 rounded-lg shrink-0 border border-red-200">
                                           <ExternalLink size={16} />
@@ -1109,10 +1226,10 @@ export default function App() {
                                                   "{item.anchorText}"
                                               </span>
                                               <span className="text-neutral-400">→</span>
-                                              <a 
-                                                  href={item.url} 
-                                                  target="_blank" 
-                                                  rel="noreferrer" 
+                                              <a
+                                                  href={item.url}
+                                                  target="_blank"
+                                                  rel="noreferrer"
                                                   className="text-blue-600 hover:underline font-mono text-[11px] truncate max-w-full inline-block"
                                               >
                                                   {item.url}
@@ -1122,9 +1239,10 @@ export default function App() {
                                               Context: "{item.section}"
                                           </div>
                                           <p className="text-xs text-red-800 font-medium bg-red-50/70 py-1.5 px-3 rounded-md">
-                                              <span className="font-bold">Redirect risk:</span> {item.reason}
+                                              <span className="font-bold">Redirect risk:</span> {item.reason || <span className="text-neutral-400 italic">No explanation was provided by the model.</span>}
                                           </p>
                                       </div>
+                                      <FalsePositiveButton onClick={() => submitFeedback(selectedReport.url, 'link', linkId(item), item.reason)} />
                                   </div>
                               ))}
                             </div>
@@ -1143,7 +1261,7 @@ export default function App() {
                             </div>
                           ) : (
                             <div className="grid gap-4">
-                                {selectedReport.result?.semanticIssues?.map((item, index) => {
+                                {visibleSemantic.map((item, index) => {
                                    let badgeColor = "bg-purple-50 text-purple-700 border-purple-100";
                                    let label = "Semantic HTML Warning";
                                    if (item.issueType === "address_missing_address_tag") {
@@ -1160,9 +1278,12 @@ export default function App() {
                                                <span className={`text-[10px] font-extrabold px-2 py-0.5 rounded border shrink-0 uppercase tracking-widest ${badgeColor} w-fit`}>
                                                    {label}
                                                </span>
-                                               <span className="text-[10px] text-neutral-400 font-mono">
-                                                   Issue #{index + 1}
-                                               </span>
+                                               <div className="flex items-center gap-2">
+                                                   <span className="text-[10px] text-neutral-400 font-mono">
+                                                       Issue #{index + 1}
+                                                   </span>
+                                                   <FalsePositiveButton onClick={() => submitFeedback(selectedReport.url, 'semantic', semanticId(item), item.reason)} />
+                                               </div>
                                            </div>
 
                                            <div className="space-y-3">

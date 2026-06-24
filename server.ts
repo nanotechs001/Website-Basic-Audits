@@ -1,9 +1,78 @@
+import dotenv from "dotenv";
+// Load local env files for local development. AI Studio injects secrets at
+// runtime, but locally we read them from .env.local (preferred) then .env.
+dotenv.config({ path: ".env.local" });
+dotenv.config();
+
 import express from "express";
+import fs from "fs";
 import path from "path";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import * as cheerio from "cheerio";
 import Anthropic from "@anthropic-ai/sdk";
+
+// --- Audit Learnings Store ---------------------------------------------------
+// Confirmed false positives are saved per-hostname as a markdown file and fed
+// back into future audit prompts so the model stops repeating the same mistake.
+const LEARNINGS_DIR = path.join(process.cwd(), "learnings");
+
+function learningsFileFor(hostname: string): string {
+  const safe = (hostname || "unknown").replace(/[^a-z0-9.\-_]/gi, "_");
+  return path.join(LEARNINGS_DIR, `${safe}.md`);
+}
+
+function readLearnings(hostname: string): string {
+  try {
+    const f = learningsFileFor(hostname);
+    if (fs.existsSync(f)) return fs.readFileSync(f, "utf-8").trim();
+  } catch {
+    // ignore read errors — learnings are best-effort context
+  }
+  return "";
+}
+
+// Structured sidecar (alongside the human-readable .md) used to HARD-filter
+// confirmed false positives out of results, regardless of model compliance.
+interface LearningEntry { category: string; identifier: string; }
+
+function learningsJsonFor(hostname: string): string {
+  return learningsFileFor(hostname).replace(/\.md$/, ".json");
+}
+
+function readLearningEntries(hostname: string): LearningEntry[] {
+  try {
+    const f = learningsJsonFor(hostname);
+    if (fs.existsSync(f)) {
+      const parsed = JSON.parse(fs.readFileSync(f, "utf-8"));
+      if (Array.isArray(parsed)) return parsed;
+    }
+  } catch {
+    // ignore — best-effort
+  }
+  return [];
+}
+
+// Build the identifier for a finding. MUST mirror the frontend's id builders so
+// dismissed findings match on the next scan.
+function issueIdentifier(category: string, item: any): string {
+  switch (category) {
+    case "content": return String(item?.excerpt ?? "");
+    case "heading": return `${item?.tag ?? ""}: ${item?.headingText ?? ""}`;
+    case "link": return `${item?.anchorText ?? ""} -> ${item?.url ?? ""}`;
+    case "semantic": return String(item?.elementContent ?? "");
+    default: return "";
+  }
+}
+
+function hostnameFromUrl(raw: string): string {
+  try {
+    const v = raw.startsWith("http") ? raw : "https://" + raw;
+    return new URL(v).hostname;
+  } catch {
+    return "";
+  }
+}
 
 // Initialize Gemini Client
 const ai = new GoogleGenAI({
@@ -483,9 +552,15 @@ async function startServer() {
           required: ["mainTopic", "misplacedContent", "linkIssues", "headingIssues", "semanticIssues"]
       };
 
+      const priorLearnings = readLearnings(hostnameFromUrl(url));
+
       const auditPrompt = `Analyze the following webpage content, links, headings, semantic HTML fragments, and full site structure to identify inconsistencies, structural/hierarchical problems, capitalization errors, content mismatches, design-structure mistakes, or unlinked service items.
 
 Identify the main topic/purpose of the site.
+
+CRITICAL — Respect prior reviewer feedback: A list of CONFIRMED FALSE POSITIVES from previous manual review is provided at the very bottom under "Known False Positives". You MUST NOT report any issue that matches, or is substantially similar to, an entry in that list. Treat those items as correct.
+
+Every issue object you return MUST include a specific, non-empty "reason" that clearly explains WHY it is a problem. Never return an empty or generic reason.
 
 Then audit and identify issues following these rigorous rules:
 
@@ -545,6 +620,9 @@ ${JSON.stringify(semanticSnippets, null, 2)}
 
 --- Existing Site Structure (Indexed Pages) ---
 ${JSON.stringify(siteStructure || [], null, 2)}
+
+--- Known False Positives (confirmed correct by a human reviewer — DO NOT report these or anything substantially similar) ---
+${priorLearnings || "(none recorded yet)"}
 `;
 
       let result;
@@ -592,6 +670,7 @@ Object schema shape:
 }
 
 Ensure you strictly obey capitalization rule of false positive checks.
+EVERY issue object MUST contain a specific, non-empty "reason" string (and "context" where the schema has one) explaining clearly WHY it is an issue. NEVER output an empty string for "reason". If you cannot explain why something is a problem, then it is NOT a problem and you must omit it.
 DO NOT include any prefix text, markdown formatting blocks (like \`\`\`json), backticks, or trailing chat. Return only the parsable JSON string.`;
 
         try {
@@ -606,13 +685,20 @@ DO NOT include any prefix text, markdown formatting blocks (like \`\`\`json), ba
               stream: false,
               format: "json", // Try to coerce JSON if supported by Ollama/Local API
               options: {
-                temperature: 0.2
+                temperature: 0.2,
+                // Cap the context window. Modern Ollama models (llama3.x, qwen2.5)
+                // default to a 128k window whose KV cache can need >16GB RAM and
+                // fails to load on typical machines. This keeps memory reasonable
+                // while staying large enough for the audit prompt. Override with
+                // LOCAL_LLM_NUM_CTX if you have the RAM for more.
+                num_ctx: Number(process.env.LOCAL_LLM_NUM_CTX) || 16384
               }
             })
           });
 
           if (!localResponse.ok) {
-             throw new Error(`Local server responded with ${localResponse.status}`);
+             const errBody = await localResponse.text().catch(() => "");
+             throw new Error(`Local server responded with ${localResponse.status}${errBody ? `: ${errBody.slice(0, 300)}` : ""}`);
           }
 
           const localData = await localResponse.json();
@@ -636,10 +722,13 @@ DO NOT include any prefix text, markdown formatting blocks (like \`\`\`json), ba
           throw new Error(`Local LLM audit failed: ${localErr.message || localErr}`);
         }
       } else {
+        const PRIMARY_GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+        const FALLBACK_GEMINI_MODEL = "gemini-2.0-flash";
+
         let aiResponse;
         try {
           aiResponse = await ai.models.generateContent({
-              model: "gemini-3.5-flash",
+              model: PRIMARY_GEMINI_MODEL,
               contents: auditPrompt,
               config: {
                   responseMimeType: "application/json",
@@ -648,10 +737,10 @@ DO NOT include any prefix text, markdown formatting blocks (like \`\`\`json), ba
               }
           });
         } catch (err: any) {
-          console.warn("Primary model call failed, retrying with gemini-3.5-flash model...", err);
+          console.warn(`Primary model (${PRIMARY_GEMINI_MODEL}) call failed, retrying with ${FALLBACK_GEMINI_MODEL}...`, err);
           try {
             aiResponse = await ai.models.generateContent({
-                model: "gemini-3.5-flash",
+                model: FALLBACK_GEMINI_MODEL,
                 contents: auditPrompt,
                 config: {
                     responseMimeType: "application/json",
@@ -668,6 +757,19 @@ DO NOT include any prefix text, markdown formatting blocks (like \`\`\`json), ba
         result = JSON.parse(jsonStr);
       }
       result.contentImages = contentImages;
+
+      // Hard-filter findings the user previously confirmed as false positives.
+      // This guarantees suppression on re-scans even if the model ignores the
+      // prompt instruction (small local models often do).
+      const learnedEntries = readLearningEntries(hostnameFromUrl(url));
+      if (learnedEntries.length) {
+        const isLearned = (category: string, item: any) =>
+          learnedEntries.some((e) => e.category === category && e.identifier === issueIdentifier(category, item));
+        if (Array.isArray(result.misplacedContent)) result.misplacedContent = result.misplacedContent.filter((i: any) => !isLearned("content", i));
+        if (Array.isArray(result.headingIssues)) result.headingIssues = result.headingIssues.filter((i: any) => !isLearned("heading", i));
+        if (Array.isArray(result.linkIssues)) result.linkIssues = result.linkIssues.filter((i: any) => !isLearned("link", i));
+        if (Array.isArray(result.semanticIssues)) result.semanticIssues = result.semanticIssues.filter((i: any) => !isLearned("semantic", i));
+      }
 
       res.json(result);
     } catch (error: any) {
@@ -693,18 +795,74 @@ DO NOT include any prefix text, markdown formatting blocks (like \`\`\`json), ba
         body: JSON.stringify({
           model: model,
           prompt: "Hello, this is a test. Reply with 'ok'.",
-          stream: false
+          stream: false,
+          // Match the audit request's context cap so the test loads the model the
+          // same way. Without this, modern Ollama models try to allocate a 128k
+          // context and OOM (HTTP 500) on machines with limited RAM.
+          options: {
+            num_ctx: Number(process.env.LOCAL_LLM_NUM_CTX) || 16384
+          }
         })
       });
 
       if (!localResponse.ok) {
-        return res.status(localResponse.status).json({ error: `Server returned status ${localResponse.status}` });
+        const errBody = await localResponse.text().catch(() => "");
+        return res.status(localResponse.status).json({ error: `Server returned status ${localResponse.status}${errBody ? `: ${errBody.slice(0, 300)}` : ""}` });
       }
 
       const data = await localResponse.json();
       res.json({ success: true, data });
     } catch (err: any) {
       res.status(500).json({ error: err.message || "Connection failed" });
+    }
+  });
+
+  // Record a confirmed false positive so future audits of this site learn from it.
+  app.post("/api/feedback", async (req, res) => {
+    try {
+      const { url, category, identifier, aiReason, note } = req.body;
+      if (!url || !category || !identifier) {
+        return res.status(400).json({ error: "url, category and identifier are required" });
+      }
+
+      const hostname = hostnameFromUrl(url);
+      let pathname = "/";
+      try { pathname = new URL(url.startsWith("http") ? url : "https://" + url).pathname; } catch {}
+
+      if (!fs.existsSync(LEARNINGS_DIR)) {
+        fs.mkdirSync(LEARNINGS_DIR, { recursive: true });
+      }
+      const file = learningsFileFor(hostname);
+      const isNew = !fs.existsSync(file);
+
+      const clean = (s: any, n: number) => String(s ?? "").replace(/\s+/g, " ").trim().slice(0, n);
+
+      let block = "";
+      if (isNew) {
+        block += `# Audit Learnings — ${hostname}\n\n`;
+        block += `Confirmed FALSE POSITIVES from manual review. The auditor MUST NOT report these issues (or substantially similar ones) again.\n\n`;
+      }
+      block += `- **[${clean(category, 30)}]** \`${clean(identifier, 300)}\` (on ${clean(pathname, 200)}) — confirmed correct / false positive; do not flag again.`;
+      const reason = clean(aiReason, 250);
+      if (reason) block += ` Previously the auditor wrongly claimed: "${reason}".`;
+      const userNote = clean(note, 250);
+      if (userNote) block += ` Reviewer note: ${userNote}`;
+      block += `\n`;
+
+      fs.appendFileSync(file, block, "utf-8");
+
+      // Persist the structured entry for hard filtering on the next scan. The
+      // client sends the already-composed identifier, so store it directly.
+      const entries = readLearningEntries(hostname);
+      if (!entries.some((e) => e.category === category && e.identifier === identifier)) {
+        entries.push({ category: clean(category, 30), identifier: clean(identifier, 500) });
+        fs.writeFileSync(learningsJsonFor(hostname), JSON.stringify(entries, null, 2), "utf-8");
+      }
+
+      res.json({ success: true, file: path.basename(file), hostname });
+    } catch (err: any) {
+      console.error("Feedback save error:", err);
+      res.status(500).json({ error: err.message || "Failed to save feedback" });
     }
   });
 
