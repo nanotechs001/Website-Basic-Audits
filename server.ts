@@ -722,35 +722,56 @@ DO NOT include any prefix text, markdown formatting blocks (like \`\`\`json), ba
           throw new Error(`Local LLM audit failed: ${localErr.message || localErr}`);
         }
       } else {
-        const PRIMARY_GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
-        const FALLBACK_GEMINI_MODEL = "gemini-2.0-flash";
+        // gemini-2.5-flash-lite is reliably available on the free tier and fast;
+        // gemini-2.5-flash is higher quality but more often rate-limited / 503 on
+        // free keys. gemini-2.0-flash is NOT free-tier eligible (limit 0), so avoid it.
+        const PRIMARY_GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash-lite";
+        const FALLBACK_GEMINI_MODEL = "gemini-2.5-flash";
 
-        let aiResponse;
-        try {
-          aiResponse = await ai.models.generateContent({
-              model: PRIMARY_GEMINI_MODEL,
-              contents: auditPrompt,
-              config: {
+        // Free-tier Gemini frequently returns transient 503/UNAVAILABLE under
+        // load. Try each model with a few backoff retries before giving up.
+        const modelsToTry = [PRIMARY_GEMINI_MODEL, FALLBACK_GEMINI_MODEL];
+        const MAX_RETRIES_PER_MODEL = 3;
+        const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+        const isTransient = (e: any) => {
+          const status = e?.status ?? e?.code;
+          const msg = String(e?.message ?? e ?? "");
+          return status === 503 || status === 429 || /UNAVAILABLE|high demand|overload|RESOURCE_EXHAUSTED/i.test(msg);
+        };
+
+        let aiResponse: any;
+        let lastErr: any;
+        for (const model of modelsToTry) {
+          let done = false;
+          for (let attempt = 1; attempt <= MAX_RETRIES_PER_MODEL; attempt++) {
+            try {
+              aiResponse = await ai.models.generateContent({
+                model,
+                contents: auditPrompt,
+                config: {
                   responseMimeType: "application/json",
                   responseSchema: responseSchema,
                   temperature: 0.2
-              }
-          });
-        } catch (err: any) {
-          console.warn(`Primary model (${PRIMARY_GEMINI_MODEL}) call failed, retrying with ${FALLBACK_GEMINI_MODEL}...`, err);
-          try {
-            aiResponse = await ai.models.generateContent({
-                model: FALLBACK_GEMINI_MODEL,
-                contents: auditPrompt,
-                config: {
-                    responseMimeType: "application/json",
-                    responseSchema: responseSchema,
-                    temperature: 0.2
                 }
-            });
-          } catch (fallbackErr: any) {
-            throw new Error(`AI service is temporarily unavailable due to high demand. Please try again. (Details: ${fallbackErr.message || fallbackErr})`);
+              });
+              done = true;
+              break;
+            } catch (err: any) {
+              lastErr = err;
+              if (isTransient(err) && attempt < MAX_RETRIES_PER_MODEL) {
+                console.warn(`${model} attempt ${attempt} failed (transient). Backing off...`);
+                await sleep(1500 * attempt);
+                continue;
+              }
+              console.warn(`${model} failed after ${attempt} attempt(s); trying next model if available.`);
+              break;
+            }
           }
+          if (done) break;
+        }
+
+        if (!aiResponse) {
+          throw new Error(`AI service is temporarily unavailable due to high demand. Please try again in a moment. (Details: ${lastErr?.message || lastErr})`);
         }
 
         const jsonStr = aiResponse.text?.trim() || "{}";
